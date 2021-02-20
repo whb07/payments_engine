@@ -1,139 +1,282 @@
-use std::ops;
+use crate::amount::{Amount, RecordFloatAmount};
+use serde::{Deserialize, Serialize};
 
+#[derive(Debug, PartialEq, Clone, Copy, Hash, Eq)]
+pub struct Tx(pub u32);
 
-type PaymentResult<T> = Result<T, &'static str>;
-
-#[derive(Debug, PartialEq, Copy, Clone, PartialOrd)]
-struct Amount(f64);
-
-impl Amount {
-    fn from_f64(n: f64) -> PaymentResult<Amount> {
-        if n >= 0.0001 {
-            Ok(Amount(n))
-        } else {
-            Err("An Amount cannot be smaller than 0.0001")
-        }
-    }
-}
-
-impl ops::Add<Amount> for Amount {
-    type Output = Self;
-
-    fn add(self, _rhs: Amount) -> Amount {
-        Amount(self.0 + _rhs.0)
-    }
-}
-
-impl ops::Sub<Amount> for Amount {
-    type Output = Self;
-
-    fn sub(self, _rhs: Amount) -> Amount {
-        if self >= _rhs {
-            return Amount(self.0 - _rhs.0)
-        }
-        self
-    }
-}
-
-
-#[derive(Debug)]
-struct Client(u16);
-
-#[derive(Debug)]
-struct Tx(u32);
-
-#[derive(Debug)]
-struct Output {
-    client: Client,
-    available: Amount,
-    held: Amount,
-    total: Amount,
-    locked: bool,
-}
-
-#[derive(Debug)]
-enum TxType {
+#[derive(Debug, Deserialize, Serialize, PartialEq, Hash, Eq, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum TxType {
     Deposit,
     Withdrawal,
     Dispute,
     Resolve,
-    Chargeback
+    Chargeback,
 }
 
-#[derive(Debug)]
-struct Transaction<'a>{
-    action:&'a TxType,
-    client:&'a Client,
-    tx: &'a Tx,
-    amount:Amount
+#[derive(Debug, Copy, Clone)]
+pub struct RowRecord {
+    r#type: TxType,
+    client: Client,
+    tx: Tx,
+    amount: RecordFloatAmount,
 }
 
-
-#[derive(Debug)]
-struct Account<'a>{
-    value: Amount,
-    client:&'a Client
+#[derive(Debug, PartialEq)]
+pub struct TransactionRecord {
+    pub r#type: TxType,
+    pub amount: Amount,
+    pub tx: Tx,
+    client: Client,
 }
 
-
-
-impl <'a> Account<'a> {
-    fn transact(&self,  transaction:&Transaction){
-        // match transaction.action {
-        //     TxType::Deposit => 
-        // }
-
+impl From<RowRecord> for TransactionRecord {
+    fn from(val: RowRecord) -> TransactionRecord {
+        TransactionRecord {
+            r#type: val.r#type,
+            tx: val.tx,
+            amount: Amount::from(val.amount),
+            client: val.client,
+        }
     }
-    fn deposit(&mut self, transaction:&Transaction){
-        self.value = self.value + transaction.amount
-    }
-
-    fn withdraw(&mut self, transaction:&Transaction){
-        self.value = self.value - transaction.amount
-    }
-
 }
 
+#[derive(Debug, PartialEq, Hash, Eq, Copy, Clone)]
+pub struct Client(u16);
 
+pub mod records {
+    use super::{Client, RowRecord, TransactionRecord, Tx};
+    use std::collections::HashMap;
+
+    pub mod transactions {
+        use super::funds;
+        use super::{funds::ClientFunds, Client, HashMap, RowRecord, TransactionRecord, Tx};
+        use crate::{accounts::TxType, funds::FundingStates};
+
+        #[derive(Debug, PartialEq, Hash, Eq, Copy, Clone)]
+        pub struct LogKey(pub Tx);
+
+        pub type TransactionLog = HashMap<LogKey, TransactionRecord>;
+
+        pub fn valid_resolve(current: &TransactionRecord, client_funds: &ClientFunds) -> bool {
+            if let Some(n) = client_funds.get(&current.client) {
+                match n {
+                    FundingStates::Disputed(_) => true,
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+
+        pub fn valid_transaction(
+            current: &TransactionRecord,
+            logs: &TransactionLog,
+            client_funds: &ClientFunds,
+        ) -> bool {
+            match current.r#type {
+                TxType::Dispute => logs.contains_key(&LogKey(current.tx)),
+                TxType::Resolve | TxType::Chargeback => valid_resolve(current, client_funds),
+                _ => true,
+            }
+        }
+
+        fn should_replace(current: &TransactionRecord) -> bool {
+            match current.r#type {
+                TxType::Dispute | TxType::Resolve | TxType::Chargeback => false,
+                _ => true,
+            }
+        }
+
+        pub fn insert(map: &mut TransactionLog, record: RowRecord, client_funds: &mut ClientFunds) {
+            let key = LogKey(record.tx);
+            let current = TransactionRecord::from(record);
+            if valid_transaction(&current, map, client_funds) {
+                funds::insert(client_funds, &current);
+                if should_replace(&current) {
+                    map.insert(key, current);
+                }
+            }
+        }
+    }
+
+    pub mod funds {
+        use super::{Client, HashMap, TransactionRecord};
+        use crate::funds::FundingStates;
+        pub type ClientFunds = HashMap<Client, FundingStates>;
+
+        pub fn insert(map: &mut ClientFunds, record: &TransactionRecord) {
+            let client = record.client;
+            let funds;
+            if map.contains_key(&client) {
+                funds = map.get(&client).unwrap().transact(record);
+            } else {
+                funds = FundingStates::new(record.amount, record.tx);
+            }
+            map.insert(client, funds);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::{Amount, Transaction, TxType, Tx, Client, Account};
+    use std::str::FromStr;
+
+    use records::transactions;
+
+    use super::records::funds;
+    use super::records::funds::ClientFunds;
+    use super::records::transactions::{LogKey, TransactionLog};
+    use crate::{
+        amount::{Amount, RecordFloatAmount},
+        funds::FundingStates,
+        funds::Funds,
+    };
+
+    use super::{records, Client, RowRecord, TransactionRecord, Tx, TxType};
 
     #[test]
-    fn four_precision() {
-        let floor = 0.0001;
-        assert_eq!(Amount::from_f64(floor).unwrap().0, floor);
+    fn insert_record_to_map() {
+        let record = RowRecord {
+            client: Client(1234),
+            tx: Tx(556),
+            amount: RecordFloatAmount(100.0),
+            r#type: TxType::Deposit,
+        };
+        let mut map = TransactionLog::new();
+        assert!(map.is_empty());
+        let mut client_funds = ClientFunds::new();
+        records::transactions::insert(&mut map, record, &mut client_funds);
+        assert!(!map.is_empty());
+        assert!(map.contains_key(&LogKey(Tx(556))));
 
-        let under_floor = floor - 0.000000000001;
         assert_eq!(
-            Amount::from_f64(under_floor).unwrap_err(),
-            "An Amount cannot be smaller than 0.0001"
+            map.get(&LogKey(Tx(556))).unwrap(),
+            &TransactionRecord {
+                tx: Tx(556),
+                amount: Amount::new(1000000),
+                r#type: TxType::Deposit,
+                client: Client(1234)
+            }
+        )
+    }
+    #[test]
+    fn insert_new_funds() {
+        let mut map = ClientFunds::new();
+        let record = TransactionRecord {
+            tx: Tx(556),
+            amount: Amount::new(1000),
+            r#type: TxType::Deposit,
+            client: Client(1234),
+        };
+        funds::insert(&mut map, &record);
+        assert!(map.contains_key(&record.client));
+        let fund = map.get(&record.client).unwrap();
+        assert_eq!(
+            fund,
+            &FundingStates::Valid(Funds::new(Amount::new(1000), record.tx))
         );
     }
 
     #[test]
-    fn addition_for_amount() {
-        let a = Amount(1.0);
-        let b = Amount(1.5);
-        assert_eq!(Amount(2.5), a + b);
-        assert_eq!(Amount(2.5), b + a );
-        assert_eq!(Amount(10.0), Amount(10.0) + Amount(0.0));
+    fn three_deposits() {
+        let mut map = ClientFunds::new();
+        let records = vec![
+            TransactionRecord {
+                tx: Tx(1),
+                amount: Amount::new(10000),
+                r#type: TxType::Deposit,
+                client: Client(1),
+            },
+            TransactionRecord {
+                tx: Tx(2),
+                amount: Amount::new(20000),
+                r#type: TxType::Deposit,
+                client: Client(2),
+            },
+            TransactionRecord {
+                tx: Tx(3),
+                amount: Amount::new(20000),
+                r#type: TxType::Deposit,
+                client: Client(1),
+            },
+        ];
+        records
+            .iter()
+            .for_each(|record| funds::insert(&mut map, &record));
+        assert_eq!(
+            map.get(&Client(1)).unwrap(),
+            &FundingStates::Valid(Funds::new(Amount::new(30000), Tx(3)))
+        );
+        assert_eq!(
+            map.get(&Client(2)).unwrap(),
+            &FundingStates::Valid(Funds::new(Amount::new(20000), Tx(2)))
+        );
     }
 
     #[test]
-    fn sub_for_amount() {
-        assert_eq!(Amount(2.5), Amount(5.0) - Amount(2.5));
-        assert_eq!(Amount(2.5), Amount(2.5) - Amount(3.0));
-        assert_eq!(Amount(0.0), Amount(10.0) - Amount(10.000));
+    fn not_existing() {
+        let record = RowRecord {
+            tx: Tx(1),
+            amount: RecordFloatAmount(100.0),
+            r#type: TxType::Deposit,
+            client: Client(1),
+        };
+        let bad_dispute = RowRecord {
+            tx: Tx(2),
+            amount: RecordFloatAmount(100.0),
+            r#type: TxType::Dispute,
+            client: Client(1),
+        };
+        let mut transaction_log = TransactionLog::new();
+        let mut client_funds = ClientFunds::new();
+        records::transactions::insert(&mut transaction_log, record, &mut client_funds);
+        assert!(!transaction_log.is_empty());
+        assert!(!client_funds.is_empty());
+        records::transactions::insert(&mut transaction_log, bad_dispute, &mut client_funds);
+        let xx = client_funds.get(&Client(1)).unwrap();
+        assert_eq!(
+            xx,
+            &FundingStates::Valid(Funds::new(Amount::new(1000000), Tx(1)))
+        )
     }
 
     #[test]
-    fn a_deposit_increases_accounts_value() {
-        let client = Client(1);
-        let mut account = Account{client:&client, value:Amount(0.5)};
-        let transaction = Transaction{action:&TxType::Deposit, client:&client, amount:Amount(1.0), tx:&Tx(1)};
-        account.deposit(&transaction);
-        assert_eq!(account.value, Amount(1.5));
+    fn dispute_transaction() {
+        let records = vec![
+            RowRecord {
+                tx: Tx(1),
+                amount: RecordFloatAmount(1.0),
+                r#type: TxType::Deposit,
+                client: Client(1),
+            },
+            RowRecord {
+                tx: Tx(2),
+                amount: RecordFloatAmount(2.0),
+                r#type: TxType::Deposit,
+                client: Client(2),
+            },
+            RowRecord {
+                tx: Tx(1),
+                amount: RecordFloatAmount(0.0),
+                r#type: TxType::Dispute,
+                client: Client(1),
+            },
+        ];
+        let mut transaction_log = TransactionLog::new();
+        let mut client_funds = ClientFunds::new();
+        records
+            .iter()
+            .for_each(|record| records::transactions::insert(&mut transaction_log, *record, &mut client_funds));
+        
+        // let xx = .unwrap();
+        if let Some(fund) = client_funds.get(&Client(1)) {
+            match fund {
+                FundingStates::Disputed(n) => assert_eq!(n.held, Amount::new(10000)),
+                _ => assert_eq!(true, false)
+            }
+        } else {
+           assert_eq!(true, false)
+        }
     }
 }
