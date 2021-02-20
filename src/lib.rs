@@ -13,6 +13,28 @@ impl Amount {
     }
 }
 
+// enum Transactions {
+//     Deposit,
+//     Withdrawal,
+//     Dispute,
+//     Resolve,
+//     Chargeback,
+// }
+
+#[derive(Debug)]
+struct Client(u16);
+
+#[derive(Debug)]
+struct TX(u32);
+
+#[derive(Debug)]
+struct Output {
+    client: Client,
+    available: Amount,
+    held: Amount,
+    total: Amount,
+    locked: bool,
+}
 
 #[cfg(test)]
 mod tests {
