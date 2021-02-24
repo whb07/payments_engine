@@ -3,13 +3,10 @@ use std::ops;
 use std::str::FromStr;
 
 #[derive(Debug, PartialEq, Copy, Clone, PartialOrd, Serialize, Deserialize, Eq)]
-pub struct Amount(u64);
+pub struct Amount(pub u64);
 
-impl Amount {
-    pub fn new(n: u64) -> Amount {
-        Amount(n)
-    }
-}
+#[derive(Debug, PartialEq, Copy, Clone, PartialOrd, Serialize, Deserialize, Eq)]
+pub struct ProcessedAmount(pub u64);
 
 impl FromStr for Amount {
     type Err = &'static str;
@@ -40,6 +37,12 @@ impl FromStr for Amount {
     }
 }
 
+impl Amount {
+    pub fn new(n: u64) -> Amount {
+        Amount(n)
+    }
+}
+
 impl ops::Add<Amount> for Amount {
     type Output = Self;
 
@@ -56,51 +59,5 @@ impl ops::Sub<Amount> for Amount {
             return Amount(self.0 - _rhs.0);
         }
         self
-    }
-}
-
-#[derive(Debug, PartialEq, Copy, Clone, PartialOrd, Serialize, Deserialize)]
-pub struct RecordFloatAmount(pub f64);
-
-impl From<RecordFloatAmount> for Amount {
-    fn from(val: RecordFloatAmount) -> Amount {
-        Amount::from_str(&val.0.to_string()).unwrap()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use super::Amount;
-
-    #[test]
-    fn four_precision() {
-        assert_eq!(Amount::from_str("100").unwrap().0, 1000000);
-        assert_eq!(Amount::from_str("1.234").unwrap().0, 12340);
-        assert_eq!(Amount::from_str("0.0001").unwrap().0, 1);
-        assert_eq!(Amount::from_str("5.8").unwrap().0, 58000);
-        assert_eq!(
-            Amount::from_str("0.00001").unwrap_err(),
-            "A valid amount is up to 4 digits precision"
-        );
-        assert_eq!(Amount::from_str("0.024").unwrap().0, 240);
-    }
-
-    #[test]
-    fn addition_for_amount() {
-        let a = Amount(1);
-        let b = Amount(1);
-        assert_eq!(Amount(2), a + b);
-        assert_eq!(Amount(2), b + a);
-        assert_eq!(Amount(10), Amount(10) + Amount(0));
-        assert_eq!(Amount(0), Amount(0) + Amount(0));
-    }
-
-    #[test]
-    fn sub_for_amount() {
-        assert_eq!(Amount(25), Amount(50) - Amount(25));
-        assert_eq!(Amount(25), Amount(25) - Amount(30));
-        assert_eq!(Amount(0), Amount(10) - Amount(10));
     }
 }

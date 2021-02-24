@@ -1,145 +1,196 @@
-use crate::accounts::{TransactionRecord, Tx, TxType};
 use crate::amount::Amount;
+use crate::transactions::Client;
 
-pub trait Funding {
-    fn total(&self) -> Amount;
-    fn deposit(&self, amount: Amount, tx: Tx) -> Self;
-    fn withdraw(&self, amount: Amount, tx: Tx) -> Self;
-    fn dispute(&self, disputed_record: &TransactionRecord, tx: Tx) -> Self;
-    fn resolve(&self, disputed_record: &TransactionRecord, tx: Tx) -> Self;
-    fn chargeback(&self, disputed_record: &TransactionRecord, tx: Tx) -> Self;
+#[derive(Debug, PartialEq, Eq)]
+pub enum FundingStates {
+    Valid,
+    Disputed,
+    Frozen,
 }
-
 #[derive(Debug, PartialEq, Eq)]
 pub struct Funds {
     pub held: Amount,
     pub available: Amount,
-    from: Tx,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum FundingStates {
-    Valid(Funds),
-    Disputed(Funds),
-    Frozen(Funds),
+    pub client: Client,
+    pub state: FundingStates,
 }
 
 impl Funds {
-    pub fn new(deposit: Amount, tx: Tx) -> Funds {
-        Funds {
-            available: deposit,
-            held: Amount::new(0),
-            from: tx,
-        }
-    }
-    pub fn transact(&self, record: &TransactionRecord) -> Funds {
-        match record.r#type {
-            TxType::Deposit => self.deposit(record.amount, record.tx),
-            TxType::Withdrawal => self.withdraw(record.amount, record.tx),
-            TxType::Dispute => self.dispute(record, record.tx),
-            TxType::Chargeback => self.chargeback(record, record.tx),
-            TxType::Resolve => self.resolve(record, record.tx),
-        }
-    }
-    fn do_nothing(&self) -> Funds {
-        Funds {
-            held: self.held,
-            available: self.available,
-            from: self.from,
-        }
-    }
-}
-
-impl FundingStates {
-    pub fn new(deposit: Amount, tx: Tx) -> FundingStates {
-        FundingStates::Valid(Funds::new(deposit, tx))
-    }
-    pub fn transact(&self, record: &TransactionRecord) -> FundingStates {
-        match self {
-            FundingStates::Frozen(fund) => FundingStates::Frozen(fund.do_nothing()),
-            FundingStates::Disputed(fund) => {
-                if record.r#type == TxType::Chargeback {
-                    FundingStates::Frozen(fund.transact(record))
-                } else {
-                    FundingStates::Valid(fund.transact(record))
-                }
-            }
-            FundingStates::Valid(fund) => {
-                if record.r#type == TxType::Deposit || record.r#type == TxType::Withdrawal {
-                    FundingStates::Valid(fund.transact(record))
-                } else {
-                    FundingStates::Disputed(fund.transact(record))
-                }
-            }
-        }
-    }
-}
-
-impl Funding for Funds {
-    fn total(&self) -> Amount {
+    pub fn total(&self) -> Amount {
         self.available + self.held
     }
-
-    fn deposit(&self, amount: Amount, tx: Tx) -> Funds {
-        Funds {
-            held: self.held,
-            available: self.available + amount,
-            from: tx,
-        }
-    }
-    fn withdraw(&self, amount: Amount, tx: Tx) -> Funds {
-        Funds {
-            held: self.held,
-            available: self.available - amount,
-            from: tx,
+    pub fn deposit(&mut self, amount: Amount) {
+        if not_frozen(&self) {
+            self.available = self.available + amount
         }
     }
 
-    fn dispute(&self, disputed_record: &TransactionRecord, tx: Tx) -> Funds {
-        Funds {
-            held: self.held + disputed_record.amount,
-            available: self.available - disputed_record.amount,
-            from: tx,
+    pub fn withdraw(&mut self, amount: Amount) {
+        if not_frozen(&self) {
+            self.available = self.available - amount
         }
     }
 
-    fn resolve(&self, disputed_record: &TransactionRecord, tx: Tx) -> Funds {
-        Funds {
-            held: Amount::new(0),
-            available: self.total(),
-            from: tx,
+    pub fn dispute(&mut self, amount: Amount) {
+        if not_frozen(&self) {
+            self.held = self.held + amount;
+            self.available = self.available - amount;
+            self.update_dispute();
         }
     }
 
-    fn chargeback(&self, disputed_record: &TransactionRecord, tx: Tx) -> Funds {
-        Funds {
-            held: Amount::new(0),
-            available: self.total() - self.held,
-            from: tx,
+    pub fn resolve(&mut self, amount: Amount) {
+        if not_frozen(&self) && self.state == FundingStates::Disputed {
+            self.held = self.held - amount;
+            self.available = self.available + amount;
+            self.update_dispute();
         }
     }
+
+    fn update_dispute(&mut self) -> bool {
+        if self.held.0 > 0 {
+            self.state = FundingStates::Disputed;
+            true
+        } else {
+            self.state = FundingStates::Valid;
+            false
+        }
+    }
+
+    pub fn chargeback(&mut self, amount: Amount) {
+        if not_frozen(&self) && self.state == FundingStates::Disputed {
+            self.held = self.held - amount;
+            self.state = FundingStates::Frozen;
+        }
+    }
+}
+
+pub fn not_frozen(fund: &Funds) -> bool {
+    fund.state != FundingStates::Frozen
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Amount, Funding, Funds, Tx};
+    use super::{Amount, Client, FundingStates, Funds};
     #[test]
-    fn new_fund() {
-        let amount = Amount::new(100);
-        let funds = Funds::new(amount, Tx(1));
-        assert_eq!(amount, funds.available);
-        assert_eq!(Amount::new(0), funds.held);
-        assert_eq!(amount, funds.total());
+    fn test_fund_total() {
+        let mut fund = Funds {
+            state: FundingStates::Disputed,
+            available: Amount::new(1000),
+            held: Amount::new(1000),
+            client: Client(1),
+        };
+        assert_eq!(fund.total(), Amount::new(2000));
+        fund.available = Amount::new(555);
+        fund.held = Amount::new(0);
+        assert_eq!(fund.total(), Amount::new(555));
+    }
+    #[test]
+    fn test_deposit() {
+        let mut fund = Funds {
+            state: FundingStates::Disputed,
+            available: Amount::new(0),
+            held: Amount::new(0),
+            client: Client(1),
+        };
+        assert_eq!(fund.total(), Amount::new(0));
+        fund.deposit(Amount::new(100));
+        assert_eq!(fund.total(), Amount::new(100));
+    }
+    #[test]
+    fn test_withdrawal() {
+        let mut fund = Funds {
+            state: FundingStates::Disputed,
+            available: Amount::new(0),
+            held: Amount::new(0),
+            client: Client(1),
+        };
+        assert_eq!(fund.total(), Amount::new(0));
+        // withdraw some money thats beyond our 0 balance
+        fund.withdraw(Amount::new(100));
+        assert_eq!(fund.total(), Amount::new(0));
+
+        fund.deposit(Amount::new(250));
+        fund.withdraw(Amount::new(25));
+        assert_eq!(fund.total(), Amount::new(225));
+        assert_eq!(fund.available, Amount::new(225));
+        assert_eq!(fund.held, Amount::new(0));
+        // withdraw again beyond our limit
+        fund.withdraw(Amount::new(300));
+        assert_eq!(fund.total(), Amount::new(225));
+    }
+    #[test]
+    fn test_dispute() {
+        let mut fund = Funds {
+            state: FundingStates::Disputed,
+            available: Amount::new(0),
+            held: Amount::new(0),
+            client: Client(1),
+        };
+        assert_eq!(fund.total(), Amount::new(0));
+        // withdraw some money thats beyond our 0 balance
+        fund.withdraw(Amount::new(100));
+        assert_eq!(fund.total(), Amount::new(0));
+
+        fund.deposit(Amount::new(250));
+        fund.withdraw(Amount::new(25));
+        assert_eq!(fund.total(), Amount::new(225));
+        assert_eq!(fund.available, Amount::new(225));
+        assert_eq!(fund.held, Amount::new(0));
+        // withdraw again beyond our limit
+        fund.withdraw(Amount::new(300));
+        assert_eq!(fund.total(), Amount::new(225));
+    }
+    #[test]
+    fn test_resolve() {
+        let mut fund = Funds {
+            state: FundingStates::Disputed,
+            available: Amount::new(100),
+            held: Amount::new(20),
+            client: Client(1),
+        };
+        fund.resolve(Amount::new(19));
+        assert_eq!(fund.available, Amount::new(119));
+        assert_eq!(fund.total(), Amount::new(120));
+        assert_eq!(fund.state, FundingStates::Disputed);
+        fund.resolve(Amount::new(1));
+        assert_eq!(fund.available, Amount::new(120));
+        assert_eq!(fund.state, FundingStates::Valid);
     }
 
     #[test]
-    fn total() {
-        let amount = Amount::new(100);
-        let funds = Funds {
-            available: amount,
-            held: Amount::new(23),
-            from: Tx(123),
+    fn test_resolve_on_valid() {
+        let mut fund = Funds {
+            state: FundingStates::Valid,
+            available: Amount::new(100),
+            held: Amount::new(0),
+            client: Client(1),
         };
-        assert_eq!(Amount::new(123), funds.total());
+        fund.resolve(Amount::new(20));
+        assert_eq!(fund.available, Amount::new(100));
+        assert_eq!(fund.held, Amount::new(0));
+        assert_eq!(fund.state, FundingStates::Valid);
+        fund.state = FundingStates::Disputed;
+        fund.resolve(Amount::new(20));
+        assert_eq!(fund.held, Amount::new(0));
+        assert_eq!(fund.state, FundingStates::Valid);
+    }
+
+    #[test]
+    fn test_chargeback() {
+        let mut fund = Funds {
+            state: FundingStates::Disputed,
+            available: Amount::new(100),
+            held: Amount::new(20),
+            client: Client(1),
+        };
+        fund.chargeback(Amount::new(5));
+        assert_eq!(fund.state, FundingStates::Frozen);
+        assert_eq!(fund.held, Amount::new(15));
+        assert_eq!(fund.total(), Amount::new(115));
+        // run it again
+        fund.chargeback(Amount::new(1));
+        assert_eq!(fund.total(), Amount::new(115));
+        assert_eq!(fund.held, Amount::new(15));
     }
 }
